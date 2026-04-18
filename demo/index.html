@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>voice-chat-kit — demo</title>
+<style>
+  * { box-sizing: border-box; font-family: system-ui, sans-serif; }
+  body { max-width: 800px; margin: 0 auto; padding: 24px; background: #0f0f13; color: #eee; }
+  h1 { margin: 0 0 8px; font-size: 22px; }
+  .row { display: flex; gap: 8px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+  button { background: #2a7; color: #fff; border: 0; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.stop { background: #c33; }
+  button.alt { background: #444; }
+  select, input { background: #1a1a22; color: #eee; border: 1px solid #333; padding: 6px 8px; border-radius: 4px; }
+  #log { background: #1a1a22; border: 1px solid #333; padding: 12px; border-radius: 6px; height: 340px; overflow-y: auto; font-size: 14px; line-height: 1.5; }
+  .msg-user { color: #8af; margin: 4px 0; }
+  .msg-bot  { color: #afa; margin: 4px 0; }
+  .msg-interim { color: #888; font-style: italic; }
+  .msg-system  { color: #aaa; font-size: 12px; }
+  .tag { display: inline-block; padding: 2px 6px; border-radius: 3px; background: #333; font-size: 11px; margin-right: 4px; }
+  .state { color: #fa0; font-weight: bold; }
+  label { font-size: 13px; color: #aaa; }
+</style>
+</head>
+<body>
+<h1>voice-chat-kit — demo integrado (STT + TTS + Codex)</h1>
+<p style="color:#888;font-size:13px;margin:0 0 12px">
+Fala → STT (Web Speech) → LLM Codex (<code>gpt-5.4-mini</code>) → TTS (Inworld). Barge-in ativo, streaming por sentença.
+</p>
+
+<div class="row">
+  <label>Provider TTS:</label>
+  <select id="provider">
+    <option value="inworld">Inworld</option>
+    <option value="elevenlabs">ElevenLabs</option>
+    <option value="browser">Browser nativo</option>
+  </select>
+  <label>Voz:</label>
+  <select id="voice" style="min-width:200px"><option>carregando…</option></select>
+  <button class="alt" id="refresh">↻</button>
+  <button class="alt" id="test">🔊 testar voz</button>
+</div>
+
+<div class="row">
+  <label>Idioma STT:</label>
+  <select id="lang">
+    <option value="pt-BR" selected>pt-BR</option>
+    <option value="en-US">en-US</option>
+    <option value="es-ES">es-ES</option>
+  </select>
+  <label><input type="checkbox" id="bargeIn" checked> barge-in</label>
+  <label><input type="checkbox" id="stream" checked> streaming LLM</label>
+</div>
+
+<div class="row">
+  <button id="start">🎙 Iniciar</button>
+  <button class="stop" id="stop" disabled>■ Parar</button>
+  <button class="alt" id="clear">Limpar</button>
+  <span class="state" id="state">idle</span>
+</div>
+
+<div id="log"></div>
+
+<script type="module">
+import { VoiceLoop } from "../src/VoiceLoop.js";
+import { WebSpeechSTT } from "../src/adapters/WebSpeechSTT.js";
+import { BrowserTTS } from "../src/adapters/BrowserTTS.js";
+
+const $ = (id) => document.getElementById(id);
+const log = $("log");
+const sessionId = "demo-" + Math.random().toString(36).slice(2, 8);
+
+function append(cls, text) {
+  const d = document.createElement("div");
+  d.className = cls;
+  d.textContent = text;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+  return d;
+}
+
+// ---------- Voice list ----------
+async function loadVoices() {
+  const provider = $("provider").value;
+  $("voice").innerHTML = "<option>carregando…</option>";
+  if (provider === "browser") {
+    const voices = new BrowserTTS({ lang: $("lang").value }).voices();
+    $("voice").innerHTML = voices.filter(v => v.lang.startsWith($("lang").value.split("-")[0]) || true)
+      .map(v => `<option value="${v.id}">${v.name} [${v.lang}${v.local ? " local" : ""}]</option>`).join("");
+    return;
+  }
+  try {
+    const r = await fetch(`/tts/voices?provider=${provider}`);
+    const { voices, error } = await r.json();
+    if (error) { $("voice").innerHTML = `<option>erro: ${error}</option>`; return; }
+    $("voice").innerHTML = voices.map(v => {
+      const tag = [v.gender, v.accent].filter(Boolean).join(" · ");
+      return `<option value="${v.id}">${v.name}${tag ? " — " + tag : ""}${v.desc ? " · " + v.desc : ""}</option>`;
+    }).join("");
+  } catch (e) { $("voice").innerHTML = `<option>offline: ${e.message}</option>`; }
+}
+$("provider").addEventListener("change", loadVoices);
+$("refresh").addEventListener("click", loadVoices);
+
+// ---------- TTS adapters ----------
+function makeTTS() {
+  const provider = $("provider").value;
+  const voiceId = $("voice").value;
+  if (provider === "browser") return new BrowserTTS({ voiceName: voiceId, lang: $("lang").value });
+  // proxy-based (Inworld / ElevenLabs) — chama nosso /tts pra esconder chave
+  return new ProxyTTS({ provider, voiceId });
+}
+
+class ProxyTTS {
+  constructor({ provider, voiceId }) {
+    this.provider = provider; this.voiceId = voiceId;
+    this.queue = []; this.current = null; this.playing = false;
+    this._handlers = { start: new Set(), end: new Set(), error: new Set() };
+  }
+  on(e, h) { this._handlers[e].add(h); return () => this._handlers[e].delete(h); }
+  _emit(e, d) { for (const h of this._handlers[e]) { try { h(d); } catch {} } }
+  setVoice(v) { this.voiceId = v; }
+  get isPlaying() { return this.playing; }
+  speak(text) {
+    return new Promise((resolve, reject) => { this.queue.push({ text, resolve, reject }); this._drain(); });
+  }
+  async _drain() {
+    if (this.playing || !this.queue.length) return;
+    this.playing = true;
+    const { text, resolve, reject } = this.queue.shift();
+    const ctrl = new AbortController();
+    try {
+      const r = await fetch("/tts", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, provider: this.provider, voiceId: this.voiceId }),
+        signal: ctrl.signal,
+      });
+      if (!r.ok) throw new Error(`TTS ${r.status}: ${await r.text()}`);
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      this.current = { audio, abort: () => ctrl.abort() };
+      this._emit("start", { text });
+      audio.onended = () => { URL.revokeObjectURL(url); this._emit("end", { text }); resolve(); this._next(); };
+      audio.onerror = (e) => { URL.revokeObjectURL(url); reject(e); this._next(); };
+      await audio.play();
+    } catch (e) { this._emit("error", e); reject(e); this._next(); }
+  }
+  _next() { this.current = null; this.playing = false; this._drain(); }
+  stop() {
+    this.queue = [];
+    if (this.current) { this.current.abort?.(); try { this.current.audio.pause(); } catch {} this.current = null; }
+    this.playing = false;
+  }
+}
+
+// ---------- LLM via /llm/chat/:sid (SSE) ----------
+async function* codexStream(messages, { signal } = {}) {
+  // só o último user message vai — o servidor mantém histórico por sid
+  const lastUser = [...messages].reverse().find(m => m.role === "user");
+  const r = await fetch(`/llm/chat/${sessionId}`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content: lastUser?.content ?? "" }),
+    signal,
+  });
+  if (!r.ok) throw new Error(`LLM ${r.status}`);
+  const reader = r.body.getReader(); const dec = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read(); if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const parts = buf.split("\n\n"); buf = parts.pop();
+    for (const ev of parts) {
+      const line = ev.split("\n").find(l => l.startsWith("data: "));
+      if (!line) continue;
+      const data = JSON.parse(line.slice(6));
+      if (data.error) throw new Error(data.error);
+      if (data.done) return;
+      if (data.delta) yield data.delta;
+    }
+  }
+}
+
+// ---------- VoiceLoop ----------
+let loop = null;
+let botBubble = null; let interimBubble = null;
+
+$("start").addEventListener("click", () => {
+  if (loop) return;
+  try {
+    const stt = new WebSpeechSTT({ lang: $("lang").value });
+    const tts = makeTTS();
+    loop = new VoiceLoop({
+      stt, tts, llm: codexStream,
+      bargeIn: $("bargeIn").checked,
+      stream: $("stream").checked,
+      system: "Você é um assistente de voz em PT-BR. Respostas curtas (1-2 frases).",
+      onState: (s) => $("state").textContent = s,
+      onTranscript: (t, { final }) => {
+        if (final) {
+          interimBubble?.remove(); interimBubble = null;
+          append("msg-user", "🗣 " + t);
+          botBubble = append("msg-bot", "🤖 ");
+        } else {
+          if (!interimBubble) interimBubble = append("msg-interim", "");
+          interimBubble.textContent = "🗣 " + t + " …";
+        }
+      },
+      onReply: (t) => { if (botBubble) botBubble.textContent = "🤖 " + t; },
+      onError: (e) => append("msg-system", "[erro] " + (e.message ?? e)),
+    });
+    loop.start();
+    $("start").disabled = true; $("stop").disabled = false;
+    append("msg-system", "Sessão iniciada. Fale algo.");
+  } catch (e) { append("msg-system", "[erro] " + e.message); }
+});
+
+$("stop").addEventListener("click", () => {
+  loop?.stop(); loop = null;
+  $("start").disabled = false; $("stop").disabled = true;
+  $("state").textContent = "idle";
+  append("msg-system", "Sessão encerrada.");
+});
+
+$("clear").addEventListener("click", () => { log.innerHTML = ""; loop?.reset?.(); });
+
+$("test").addEventListener("click", async () => {
+  const tts = makeTTS();
+  try { await tts.speak("Esta é a voz " + $("voice").value + ", do provider " + $("provider").value + "."); }
+  catch (e) { append("msg-system", "[erro teste] " + e.message); }
+});
+
+loadVoices();
+</script>
+</body>
+</html>

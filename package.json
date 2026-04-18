@@ -1,0 +1,19 @@
+{
+  "name": "voice-chat-kit",
+  "version": "0.1.0",
+  "description": "Kit plug-and-play de STT + TTS com adapters intercambiáveis (Web Speech, Whisper, Inworld, ElevenLabs, Browser TTS). Inclui orquestrador VoiceLoop, hooks React, proxy server.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./adapters/*": "./src/adapters/*.js",
+    "./hooks/react": "./src/hooks/useVoiceChat.js"
+  },
+  "scripts": {
+    "demo": "node server/proxy.js",
+    "demo:voice-chat": "node server/proxy.js"
+  },
+  "engines": { "node": ">=18" },
+  "keywords": ["stt", "tts", "voice", "speech", "inworld", "whisper", "elevenlabs"],
+  "license": "MIT"
+}
